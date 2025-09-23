@@ -3,6 +3,8 @@
 # Manually managing azure-functions-worker may cause unexpected issues
 
 azure-functions
+azure-storage-blob
+azure-search-documents
 beautifulsoup4
 requests
 validators

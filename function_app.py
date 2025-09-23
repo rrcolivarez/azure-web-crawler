@@ -7,7 +7,8 @@ import json
 import uuid
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
-
+from dotenv import load_dotenv
+import os
 from bs4 import BeautifulSoup
 from azure.storage.blob import BlobServiceClient
 from azure.search.documents import SearchClient
@@ -21,6 +22,7 @@ from azure.search.documents.indexes.models import (
     ComplexField
 )
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 
 # Load values from .env file into environment
 load_dotenv()
@@ -306,28 +308,44 @@ def initialize_search_index():
             credential=AzureKeyCredential(SEARCH_API_KEY)
         )
         
-        # Define the search index schema
-        fields = [
-            SimpleField(name="id", type=SearchFieldDataType.String, key=True),
-            SearchableField(name="url", type=SearchFieldDataType.String),
-            SearchableField(name="title", type=SearchFieldDataType.String),
-            SearchableField(name="content", type=SearchFieldDataType.String),
-            SearchableField(name="meta_description", type=SearchFieldDataType.String),
-            SimpleField(name="crawl_timestamp", type=SearchFieldDataType.DateTimeOffset),
-            SimpleField(name="depth", type=SearchFieldDataType.Int32),
-            SimpleField(name="links_count", type=SearchFieldDataType.Int32)
-        ]
-        
-        # Create or update the index
-        index = SearchIndex(name=SEARCH_INDEX_NAME, fields=fields)
-        index_client.create_or_update_index(index)
-        
-        # Return search client for documents
-        return SearchClient(
-            endpoint=SEARCH_SERVICE_ENDPOINT,
-            index_name=SEARCH_INDEX_NAME,
-            credential=AzureKeyCredential(SEARCH_API_KEY)
-        )
+        # Check if index already exists
+        try:
+            existing_index = index_client.get_index(SEARCH_INDEX_NAME)
+            logging.info(f"Using existing search index: {SEARCH_INDEX_NAME}")
+            
+            # Return search client for documents
+            return SearchClient(
+                endpoint=SEARCH_SERVICE_ENDPOINT,
+                index_name=SEARCH_INDEX_NAME,
+                credential=AzureKeyCredential(SEARCH_API_KEY)
+            )
+            
+        except ResourceNotFoundError:
+            # Index doesn't exist, create it
+            logging.info(f"Creating new search index: {SEARCH_INDEX_NAME}")
+            
+            # Define the search index schema
+            fields = [
+                SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+                SearchableField(name="url", type=SearchFieldDataType.String),
+                SearchableField(name="title", type=SearchFieldDataType.String),
+                SearchableField(name="content", type=SearchFieldDataType.String),
+                SearchableField(name="meta_description", type=SearchFieldDataType.String),
+                SimpleField(name="crawl_timestamp", type=SearchFieldDataType.DateTimeOffset),
+                SimpleField(name="depth", type=SearchFieldDataType.Int32),
+                SimpleField(name="links_count", type=SearchFieldDataType.Int32)
+            ]
+            
+            # Create the index
+            index = SearchIndex(name=SEARCH_INDEX_NAME, fields=fields)
+            index_client.create_index(index)
+            
+            # Return search client for documents
+            return SearchClient(
+                endpoint=SEARCH_SERVICE_ENDPOINT,
+                index_name=SEARCH_INDEX_NAME,
+                credential=AzureKeyCredential(SEARCH_API_KEY)
+            )
         
     except Exception as error:
         logging.error(f"Error initializing search index: {str(error)}")
@@ -340,8 +358,11 @@ def index_content_in_search(search_client, crawled_data):
         documents = []
         
         for page in crawled_data:
+            # Create a deterministic ID based on URL to avoid duplicates
+            page_id = str(uuid.uuid5(uuid.NAMESPACE_URL, page["url"]))
+            
             document = {
-                "id": str(uuid.uuid4()),
+                "id": page_id,
                 "url": page["url"],
                 "title": page["title"],
                 "content": page["content"],
@@ -354,11 +375,16 @@ def index_content_in_search(search_client, crawled_data):
         
         # Upload documents to search index
         if documents:
-            result = search_client.upload_documents(documents)
+            # Use merge_or_upload to handle potential duplicates
+            result = search_client.merge_or_upload_documents(documents)
             successful_count = sum(1 for r in result if r.succeeded)
             
             if successful_count < len(documents):
                 logging.warning(f"Only {successful_count}/{len(documents)} documents indexed successfully")
+                # Log failed documents for debugging
+                for i, r in enumerate(result):
+                    if not r.succeeded:
+                        logging.error(f"Failed to index document {i}: {r.error_message if hasattr(r, 'error_message') else 'Unknown error'}")
             
             return successful_count
         
