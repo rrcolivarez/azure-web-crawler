@@ -127,6 +127,15 @@ $tf/
 # Guidance Automation Toolkit
 *.gpState
 
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
 # ReSharper is a .NET coding add-in
 _ReSharper*/
 *.[Rr]e[Ss]harper
