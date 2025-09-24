@@ -144,7 +144,7 @@ def crawl_website_recursive(start_url, max_depth, visited=None, current_depth=0)
             "meta_description": get_meta_tag(page_data),
             "links": get_all_urls(page_data, start_url),
             "content": get_page_content(page_data),
-            "crawl_timestamp": datetime.utcnow().isoformat(),
+            "crawl_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             "depth": current_depth
         }
         crawled_data.append(page_info)
