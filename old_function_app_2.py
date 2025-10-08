@@ -9,8 +9,6 @@ from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from dotenv import load_dotenv
 import os
-import tempfile
-import shutil
 from bs4 import BeautifulSoup
 from azure.storage.blob import BlobServiceClient
 from azure.search.documents import SearchClient
@@ -25,14 +23,6 @@ from azure.search.documents.indexes.models import (
 )
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
-import PyPDF2
-from io import BytesIO
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # Load values from .env file into environment
 load_dotenv()
@@ -49,13 +39,6 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_EMBEDDING_MODEL = os.getenv("AZURE_OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
-# Social media domains to exclude
-SOCIAL_MEDIA_DOMAINS = {
-    'facebook.com', 'twitter.com', 'x.com', 'instagram.com', 'linkedin.com',
-    'youtube.com', 'tiktok.com', 'pinterest.com', 'snapchat.com', 'reddit.com',
-    'whatsapp.com', 'telegram.org', 'discord.com', 'twitch.tv', 'vimeo.com',
-    'tumblr.com', 'flickr.com', 'medium.com'
-}
 
 
 @app.route(route="search_site", methods=["POST"])
@@ -64,7 +47,7 @@ def search_site(req: func.HttpRequest) -> func.HttpResponse:
 
     # Checks for a URL JSON property in the HTTP Request body.
     url = req.params.get('url')
-    max_depth = req.params.get('max_depth')
+    max_depth = req.params.get('max_depth', 1)
     
     if not url:
         try:
@@ -73,71 +56,37 @@ def search_site(req: func.HttpRequest) -> func.HttpResponse:
             pass
         else:
             url = req_body.get('url')
-            max_depth = req_body.get('max_depth')
+            max_depth = req_body.get('max_depth', 1)
 
     if url:
         if validators.url(url):
             try:
-                # Handle max_depth parameter
-                if max_depth is not None and max_depth != '':
-                    try:
-                        max_depth = int(max_depth)
-                        if max_depth < 0:
-                            return func.HttpResponse(
-                                json.dumps({"error": "max_depth must be a non-negative integer or null/empty for unlimited crawling"}),
-                                status_code=400,
-                                mimetype="application/json"
-                            )
-                    except (ValueError, TypeError):
-                        return func.HttpResponse(
-                            json.dumps({"error": "max_depth must be a valid integer or null/empty for unlimited crawling"}),
-                            status_code=400,
-                            mimetype="application/json"
-                        )
-                else:
-                    max_depth = None  # Unlimited depth
-                
+                max_depth = int(max_depth)
                 response = orchestrator_function(url, max_depth)
                 return func.HttpResponse(json.dumps(response, indent=2),
                                      status_code=200,
                                      mimetype="application/json")
             except Exception as e:
                 logging.error(f"Error processing request: {str(e)}")
-                logging.error(traceback.format_exc())
                 return func.HttpResponse(
-                    json.dumps({"error": f"Error processing request: {str(e)}"}),
-                    status_code=500,
-                    mimetype="application/json"
+                    f"Error processing request: {str(e)}",
+                    status_code=500
                 )
         else:
             return func.HttpResponse(
-                json.dumps({"error": "The URL was invalid."}),
-                status_code=400,
-                mimetype="application/json"
+                "The URL was invalid.",
+                status_code=400
             )
     else:
         return func.HttpResponse(
-            json.dumps({
-                "error": "No URL was passed. Please input a URL.",
-                "usage": {
-                    "url": "required - the starting URL to crawl",
-                    "max_depth": "optional - integer for max depth (0=only start page, 1=start page + direct links, etc.) or null/omit for unlimited"
-                },
-                "examples": [
-                    {"url": "https://example.com", "max_depth": 2},
-                    {"url": "https://example.com", "max_depth": 0},
-                    {"url": "https://example.com"}
-                ]
-            }),
-            status_code=400,
-            mimetype="application/json"
+            "No URL was passed. Please input a URL.",
+            status_code=400
         )
 
 
-def orchestrator_function(start_url, max_depth=None):
+def orchestrator_function(start_url, max_depth=1):
     """
     Orchestrates the web crawling, blob storage, and AI search indexing process.
-    max_depth=None means unlimited depth crawling
     """
     try:
         # Initialize Azure services
@@ -156,7 +105,6 @@ def orchestrator_function(start_url, max_depth=None):
         return {
             "status": "success",
             "crawled_pages": len(crawled_data),
-            "max_depth": "unlimited" if max_depth is None else max_depth,
             "blob_storage": blob_info,
             "search_index": {
                 "indexed_documents": indexed_count,
@@ -166,7 +114,6 @@ def orchestrator_function(start_url, max_depth=None):
                 {
                     "url": page["url"],
                     "title": page["title"],
-                    "content_type": page.get("content_type", "html"),
                     "links_found": len(page["links"])
                 }
                 for page in crawled_data
@@ -179,124 +126,36 @@ def orchestrator_function(start_url, max_depth=None):
         raise error
 
 
-def is_social_media_link(url):
-    """Check if URL is from a social media platform."""
-    try:
-        domain = urlparse(url).netloc.lower()
-        # Remove 'www.' prefix if present
-        domain = domain.replace('www.', '')
-        
-        # Check if domain matches or is subdomain of social media
-        for social_domain in SOCIAL_MEDIA_DOMAINS:
-            if domain == social_domain or domain.endswith('.' + social_domain):
-                return True
-        return False
-    except:
-        return False
-
-
-def is_pdf_url(url):
-    """Check if URL points to a PDF file."""
-    parsed = urlparse(url)
-    return parsed.path.lower().endswith('.pdf')
-
-
-def extract_pdf_content(url):
-    """Download and extract text content from PDF."""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, timeout=30, headers=headers)
-        response.raise_for_status()
-        
-        pdf_file = BytesIO(response.content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        
-        text_content = []
-        for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
-            text_content.append(page.extract_text())
-        
-        full_text = '\n'.join(text_content)
-        
-        # Limit content length
-       #return full_text[:10000] if len(full_text) > 10000 else full_text
-        return full_text
-        
-    except Exception as e:
-        logging.error(f"Error extracting PDF content from {url}: {str(e)}")
-        return ""
-
-
-def crawl_website_recursive(start_url, max_depth=None, visited=None, current_depth=0):
+def crawl_website_recursive(start_url, max_depth, visited=None, current_depth=0):
     """
-    Recursively crawl website up to specified depth (unlimited if max_depth=None).
+    Recursively crawl website up to specified depth.
     """
     if visited is None:
         visited = set()
     
-    # Check depth limit only if max_depth is specified
-    if max_depth is not None and current_depth > max_depth:
-        return []
-    
-    if start_url in visited:
-        return []
-    
-    # Skip social media links
-    if is_social_media_link(start_url):
-        logging.info(f"Skipping social media link: {start_url}")
+    if current_depth > max_depth or start_url in visited:
         return []
     
     visited.add(start_url)
     crawled_data = []
     
     try:
-        # Check if it's a PDF
-        if is_pdf_url(start_url):
-            logging.info(f"Processing PDF: {start_url}")
-            pdf_content = extract_pdf_content(start_url)
-            
-            page_info = {
-                "url": start_url,
-                "title": f"PDF: {start_url.split('/')[-1]}",
-                "meta_description": "PDF Document",
-                "links": [],
-                "content": pdf_content,
-                "content_type": "pdf",
-                "crawl_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                "depth": current_depth
-            }
-            crawled_data.append(page_info)
-            return crawled_data
-        
-        # Crawl regular HTML page
+        # Crawl current page
         page_data = crawl_site(start_url)
-        all_links = get_all_urls(page_data, start_url)
-        
-        # Filter out social media links
-        filtered_links = [link for link in all_links if not is_social_media_link(link)]
-        
         page_info = {
             "url": start_url,
             "title": get_page_title(page_data),
             "meta_description": get_meta_tag(page_data),
-            "links": filtered_links,
+            "links": get_all_urls(page_data, start_url),
             "content": get_page_content(page_data),
-            "content_type": "html",
             "crawl_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             "depth": current_depth
         }
         crawled_data.append(page_info)
         
-        # Crawl linked pages (no depth limit if max_depth is None)
-        should_continue = max_depth is None or current_depth < max_depth
-        
-        if should_continue:
-            # Limit to 50 links per page to prevent excessive crawling
-            links_to_crawl = filtered_links
-            
-            for link in links_to_crawl:
+        # If we haven't reached max depth, crawl linked pages
+        if current_depth < max_depth:
+            for link in page_info["links"][:10]:  # Limit to first 10 links to avoid excessive crawling
                 if link not in visited and is_same_domain(start_url, link):
                     try:
                         sub_pages = crawl_website_recursive(link, max_depth, visited, current_depth + 1)
@@ -311,130 +170,13 @@ def crawl_website_recursive(start_url, max_depth=None, visited=None, current_dep
 
 
 def crawl_site(url):
-    """Submits the HTTP request to the user-inputted URL with JavaScript support."""
+    """Submits the HTTP request to the user-inputted URL."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-    
-    # Try regular request first
-    try:
-        response = requests.get(url, allow_redirects=True, timeout=30, headers=headers)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "lxml")
-        
-        # Check if page has meaningful content or is mostly loading/placeholder
-        text_content = soup.get_text().strip()
-        #print(text_content)
-        
-        # If content is suspiciously short or contains loading indicators, try Selenium
-        if len(text_content) < 200 or 'loading' in text_content.lower() or 'please wait' in text_content.lower():
-            logging.info(f"Dynamic content detected for {url}, using headless browser...")
-            return crawl_site_with_selenium(url)
-        
-        return soup
-        
-    except Exception as e:
-        logging.warning(f"Regular request failed for {url}, trying headless browser: {str(e)}")
-        return crawl_site_with_selenium(url)
-
-
-# def crawl_site_with_selenium(url):
-#     """Crawl site using Selenium for JavaScript-rendered content."""
-#     driver = None
-#     try:
-#         # Configure Chrome options for headless mode
-#         chrome_options = Options()
-#         chrome_options.add_argument('--headless')
-#         chrome_options.add_argument('--no-sandbox')
-#         chrome_options.add_argument('--disable-dev-shm-usage')
-#         chrome_options.add_argument('--disable-gpu')
-#         chrome_options.add_argument('--window-size=1920,1080')
-#         chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-        
-#         # Initialize the Chrome driver
-#         driver = webdriver.Chrome(options=chrome_options)
-#         driver.set_page_load_timeout(30)
-        
-#         # Navigate to the URL
-#         driver.get(url)
-        
-#         # Wait for content to load - adjust selector based on common patterns
-#         try:
-#             # Wait for body to have substantial content
-#             WebDriverWait(driver, 15).until(
-#                 lambda d: len(d.find_element(By.TAG_NAME, "body").text.strip()) > 200
-#             )
-#         except TimeoutException:
-#             logging.warning(f"Timeout waiting for content to load on {url}")
-        
-#         # Additional wait for dynamic content
-#         import time
-#         time.sleep(2)
-        
-#         # Get the page source after JavaScript execution
-#         page_source = driver.page_source
-        
-#         return BeautifulSoup(page_source, "lxml")
-        
-#     except WebDriverException as e:
-#         logging.error(f"Selenium WebDriver error for {url}: {str(e)}")
-#         # Fallback to basic request
-#         response = requests.get(url, timeout=30)
-#         return BeautifulSoup(response.text, "lxml")
-        
-#     except Exception as e:
-#         logging.error(f"Error in Selenium crawling for {url}: {str(e)}")
-#         raise
-        
-#     finally:
-#         if driver:
-#             driver.quit()
-
-def crawl_site_with_selenium(url):
-    """Crawl site using Selenium for JavaScript-rendered content."""
-    driver = None
-    user_data_dir = tempfile.mkdtemp()  # unique temp dir each time
-    try:
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument(f'--user-data-dir={user_data_dir}')  # ✅ unique
-        chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                                    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
-
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(30)
-
-        driver.get(url)
-        try:
-            WebDriverWait(driver, 15).until(
-                lambda d: len(d.find_element(By.TAG_NAME, "body").text.strip()) > 200
-            )
-        except TimeoutException:
-            logging.warning(f"Timeout waiting for content to load on {url}")
-
-        import time
-        time.sleep(5)
-        page_source = driver.page_source
-        return BeautifulSoup(page_source, "lxml")
-
-    except WebDriverException as e:
-        logging.error(f"Selenium WebDriver error for {url}: {str(e)}")
-        response = requests.get(url, timeout=30)
-        return BeautifulSoup(response.text, "lxml")
-
-    except Exception as e:
-        logging.error(f"Error in Selenium crawling for {url}: {str(e)}")
-        raise
-
-    finally:
-        if driver:
-            driver.quit()
-        # ✅ Clean up temp directory to avoid filling /tmp
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+    response = requests.get(url, allow_redirects=True, timeout=30, headers=headers)
+    response.raise_for_status()
+    return BeautifulSoup(response.text, "lxml")
 
 
 def get_page_title(data):
@@ -507,7 +249,7 @@ def get_page_content(data):
         text = ' '.join(chunk for chunk in chunks if chunk)
         
         # Limit content length for indexing
-        return text[:10000] if len(text) > 10000 else text
+        return text[:5000] if len(text) > 5000 else text
         
     except Exception as error:
         logging.error(f"Error extracting page content: {str(error)}")
@@ -593,7 +335,6 @@ def initialize_search_index():
                 SearchableField(name="title", type=SearchFieldDataType.String),
                 SearchableField(name="content", type=SearchFieldDataType.String),
                 SearchableField(name="meta_description", type=SearchFieldDataType.String),
-                SearchableField(name="content_type", type=SearchFieldDataType.String),
                 SimpleField(name="crawl_timestamp", type=SearchFieldDataType.DateTimeOffset),
                 SimpleField(name="depth", type=SearchFieldDataType.Int32),
                 SimpleField(name="links_count", type=SearchFieldDataType.Int32)
@@ -630,7 +371,6 @@ def index_content_in_search(search_client, crawled_data):
                 "title": page["title"],
                 "content": page["content"],
                 "meta_description": page["meta_description"],
-                "content_type": page.get("content_type", "html"),
                 "crawl_timestamp": page["crawl_timestamp"],
                 "depth": page["depth"],
                 "links_count": len(page["links"])
